@@ -8,24 +8,6 @@ import (
 	"time"
 )
 
-func waitForPollingStopReady(t *testing.T, state *pollingStopState, count int) {
-	t.Helper()
-	done := make(chan struct{})
-	go func() {
-		state.mu.Lock()
-		for state.ready < count {
-			state.cond.Wait()
-		}
-		state.mu.Unlock()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatalf("polling workers did not reach the stop barrier")
-	}
-}
-
 func TestPollingRefreshAndCloseCheckpointCounts(t *testing.T) {
 	for _, testCase := range []struct {
 		name        string
@@ -80,9 +62,6 @@ func TestPollingFinalMarkSurvivesOlderPeriodicCommit(t *testing.T) {
 			k := newPollingKinesumer(t, store, 2, fixture)
 			k.autoCommit = true
 			k.commitInterval = defaultCommitInterval
-			state := &pollingStopState{}
-			state.reset(2, true)
-			k.pollingStop = state
 			for stream, shards := range k.shards {
 				markPollingOffset(k, stream, shards[0].ID, "100")
 			}
@@ -109,7 +88,6 @@ func TestPollingFinalMarkSurvivesOlderPeriodicCommit(t *testing.T) {
 			k.wait.Add(1)
 			go func() {
 				defer k.wait.Done()
-				defer state.workerReady()
 				k.commitPeriodically()
 				close(periodicDone)
 			}()
@@ -121,14 +99,10 @@ func TestPollingFinalMarkSurvivesOlderPeriodicCommit(t *testing.T) {
 				}
 			}
 
-			workerDone := make(chan struct{}, 2)
 			for stream, shards := range k.shards {
 				stream, shard := stream, shards[0]
 				k.wait.Add(1)
-				go func() {
-					k.consumeLoop(stream, shard)
-					workerDone <- struct{}{}
-				}()
+				go k.consumeLoop(stream, shard)
 			}
 			for range k.shards {
 				select {
@@ -138,6 +112,7 @@ func TestPollingFinalMarkSurvivesOlderPeriodicCommit(t *testing.T) {
 				}
 			}
 			operationDone = make(chan struct{})
+			stop := k.stop
 			go func() {
 				if operation == "pause" {
 					k.pause()
@@ -146,20 +121,17 @@ func TestPollingFinalMarkSurvivesOlderPeriodicCommit(t *testing.T) {
 				}
 				close(operationDone)
 			}()
-			// Workers have completed their 200 marks and reached the final-flush barrier.
-			waitForPollingStopReady(t, state, len(k.shards))
+			select {
+			case <-stop:
+			case <-time.After(3 * time.Second):
+				releaseOld()
+				t.Fatal("lifecycle operation did not signal polling workers")
+			}
 			releaseOld()
 			select {
 			case <-operationDone:
 			case <-time.After(8 * time.Second):
 				t.Fatal("lifecycle operation did not finish after releasing the older write")
-			}
-			for range k.shards {
-				select {
-				case <-workerDone:
-				case <-time.After(3 * time.Second):
-					t.Fatal("polling worker did not return after the final flush")
-				}
 			}
 			select {
 			case <-periodicDone:
@@ -306,7 +278,7 @@ func TestPollingLifecycleCommitSkipsMissingOffsets(t *testing.T) {
 	k := newPollingKinesumer(t, store, 0, fixture)
 	k.shards["stream-0"] = Shards{&Shard{ID: "shard-0"}}
 
-	k.commitPollingCheckPoints()
+	k.commitPollingShard("stream-0", "shard-0")
 	if calls, rows := store.stats(); calls != 0 || rows != 0 {
 		t.Fatalf("lifecycle flush wrote %d rows in %d calls without offsets", rows, calls)
 	}
@@ -363,7 +335,7 @@ func (s *handoffReassignmentStore) GetShards(context.Context, string) (Shards, e
 	return Shards{&Shard{ID: "shard-a"}, &Shard{ID: "shard-b"}}, nil
 }
 
-func TestPollingFinalFlushPrecedesWorkerExit(t *testing.T) {
+func TestPollingLifecycleWaitsForWorkerCheckpointWrites(t *testing.T) {
 	for _, testCase := range []struct {
 		name      string
 		rebalance bool
@@ -408,9 +380,6 @@ func TestPollingFinalFlushPrecedesWorkerExit(t *testing.T) {
 				iterator := "stream-0/" + shardID
 				k.nextIters["stream-0"].Store(shardID, &iterator)
 			}
-			k.pollingStop = &pollingStopState{}
-			k.pollingStop.reset(2, false)
-			workerDone := make(chan string, 2)
 			operationDone := make(chan struct{})
 			var operationErr chan error
 			var releaseAOnce, releaseBOnce, releaseWriteOnce sync.Once
@@ -433,10 +402,7 @@ func TestPollingFinalFlushPrecedesWorkerExit(t *testing.T) {
 			for _, shard := range k.shards["stream-0"] {
 				shard := shard
 				k.wait.Add(1)
-				go func() {
-					k.consumeLoop("stream-0", shard)
-					workerDone <- shard.ID
-				}()
+				go k.consumeLoop("stream-0", shard)
 			}
 			seen := make(map[string]bool, 2)
 			for len(seen) < 2 {
@@ -469,43 +435,34 @@ func TestPollingFinalFlushPrecedesWorkerExit(t *testing.T) {
 			}
 			releaseARequest()
 			releaseBRequest()
-			var finalWrite []*ShardCheckPoint
+
+			var firstWrite []*ShardCheckPoint
 			select {
-			case finalWrite = <-gatedStore.started:
+			case firstWrite = <-gatedStore.started:
 			case <-operationDone:
 				t.Fatal("lifecycle operation returned before its checkpoint write")
 			case <-time.After(8 * time.Second):
-				t.Fatal("lifecycle checkpoint write did not reach the controlled state")
+				t.Fatal("checkpoint write did not reach the controlled state")
 			}
-			var sawA, sawB bool
-			for _, checkpoint := range finalWrite {
-				sawA = sawA || checkpoint.ShardID == "shard-a" && checkpoint.SequenceNumber == "200"
-				sawB = sawB || checkpoint.ShardID == "shard-b" && checkpoint.SequenceNumber == "200"
+			if len(firstWrite) == 0 {
+				t.Fatal("lifecycle submitted no worker checkpoint rows")
 			}
-			if !sawA || !sawB {
-				t.Fatalf("lifecycle checkpoint rows = %v, want both worker marks", finalWrite)
+			for _, checkpoint := range firstWrite {
+				if checkpoint.SequenceNumber != "200" || (checkpoint.ShardID != "shard-a" && checkpoint.ShardID != "shard-b") {
+					t.Fatalf("lifecycle checkpoint rows = %v, want marked worker rows at 200", firstWrite)
+				}
 			}
 			select {
-			case <-workerDone:
-				t.Fatal("polling worker returned before its final checkpoint write completed")
+			case <-operationDone:
+				t.Fatal("lifecycle returned while a checkpoint write was blocked")
 			default:
-			}
-			if testCase.name == "close" && isKinesumerClosedForTest(k) {
-				t.Fatal("Close exposed deregistration before its final checkpoint write completed")
 			}
 
 			gatedStore.releaseWrite()
 			select {
 			case <-operationDone:
 			case <-time.After(10 * time.Second):
-				t.Fatal("lifecycle operation did not finish after the final write")
-			}
-			for range []string{"shard-a", "shard-b"} {
-				select {
-				case <-workerDone:
-				case <-time.After(3 * time.Second):
-					t.Fatal("polling worker did not return after the final write")
-				}
+				t.Fatal("lifecycle operation did not finish after checkpoint writes")
 			}
 			if testCase.rebalance {
 				if err := <-operationErr; err != nil {
@@ -517,12 +474,12 @@ func TestPollingFinalFlushPrecedesWorkerExit(t *testing.T) {
 				}
 			}
 			gatedStore.allowWrites()
-			if testCase.name == "refresh" {
-				for _, shardID := range []string{"shard-a", "shard-b"} {
-					if got := baseStore.checkpoint("stream-0", shardID); got != "200" {
-						t.Fatalf("Refresh left %s checkpoint at %q, want 200", shardID, got)
-					}
+			for _, shardID := range []string{"shard-a", "shard-b"} {
+				if got := baseStore.checkpoint("stream-0", shardID); got != "200" {
+					t.Fatalf("%s left %s checkpoint at %q, want 200", testCase.name, shardID, got)
 				}
+			}
+			if testCase.name == "refresh" {
 				return
 			}
 			if err := baseStore.UpdateCheckPoints(context.Background(), []*ShardCheckPoint{{
@@ -540,7 +497,7 @@ func TestPollingFinalFlushPrecedesWorkerExit(t *testing.T) {
 	}
 }
 
-func TestPollingSingleWorkerCommitPrecedesCloseReturn(t *testing.T) {
+func TestPollingSingleWorkerCloseWaitsForCheckpoint(t *testing.T) {
 	baseStore := newPollingCheckpointStore()
 	store := &handoffCheckpointStore{
 		pollingCheckpointStore: baseStore,
@@ -551,13 +508,7 @@ func TestPollingSingleWorkerCommitPrecedesCloseReturn(t *testing.T) {
 	k := newPollingKinesumer(t, store, 1, fixture)
 	k.autoCommit = true
 	k.commitInterval = time.Hour
-
-	workerDone := make(chan struct{})
-	k.wait.Add(1)
-	go func() {
-		k.consumeLoop("stream-0", k.shards["stream-0"][0])
-		close(workerDone)
-	}()
+	k.start()
 
 	var operationDone chan struct{}
 	t.Cleanup(func() {
@@ -598,21 +549,16 @@ func TestPollingSingleWorkerCommitPrecedesCloseReturn(t *testing.T) {
 		t.Fatal("worker checkpoint write did not reach the controlled state")
 	}
 	select {
-	case <-workerDone:
-		t.Fatal("single polling worker returned before its checkpoint write completed")
+	case <-operationDone:
+		t.Fatal("Close returned while the checkpoint write was blocked")
 	default:
 	}
 
 	store.releaseWrite()
 	select {
-	case <-workerDone:
-	case <-time.After(3 * time.Second):
-		t.Fatal("worker did not return after its checkpoint write completed")
-	}
-	select {
 	case <-operationDone:
 	case <-time.After(8 * time.Second):
-		t.Fatal("Close did not finish after the worker checkpoint write")
+		t.Fatal("Close did not finish after its checkpoint write")
 	}
 	if err := baseStore.UpdateCheckPoints(context.Background(), []*ShardCheckPoint{{
 		Stream: "stream-0", ShardID: "shard-0", SequenceNumber: "300",
@@ -664,8 +610,6 @@ func TestPollingTerminalCleanupExcludesOldOwnerOffsets(t *testing.T) {
 				&Shard{ID: "shard-a"},
 				&Shard{ID: "shard-b"},
 			}
-			k.pollingStop = &pollingStopState{}
-			k.pollingStop.reset(2, false)
 			k.offsets["stream-0"].Delete("shard-0")
 			for _, shardID := range []string{"shard-a", "shard-b"} {
 				k.checkPoints["stream-0"].Store(shardID, "100")

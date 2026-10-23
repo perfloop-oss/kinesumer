@@ -124,59 +124,6 @@ type efoMeta struct {
 	consumerName string
 }
 
-// pollingStopState tracks quiescent polling workers for one lifecycle flush.
-type pollingStopState struct {
-	mu        sync.Mutex
-	cond      *sync.Cond
-	total     int
-	ready     int
-	flushDone bool
-}
-
-func (s *pollingStopState) reset(workerCount int, hasPeriodicCommit bool) {
-	s.mu.Lock()
-	if s.cond == nil {
-		s.cond = sync.NewCond(&s.mu)
-	}
-	s.total = workerCount
-	if hasPeriodicCommit {
-		s.total++
-	}
-	s.ready = 0
-	s.flushDone = false
-	s.mu.Unlock()
-}
-
-func (s *pollingStopState) workerReady() {
-	s.mu.Lock()
-	s.ready++
-	s.cond.Broadcast()
-	s.mu.Unlock()
-}
-
-func (s *pollingStopState) waitUntilReady() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for s.ready < s.total {
-		s.cond.Wait()
-	}
-}
-
-func (s *pollingStopState) waitForFlush() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for !s.flushDone {
-		s.cond.Wait()
-	}
-}
-
-func (s *pollingStopState) finishFlush() {
-	s.mu.Lock()
-	s.flushDone = true
-	s.cond.Broadcast()
-	s.mu.Unlock()
-}
-
 // Kinesumer implements auto re-balancing consumer group for Kinesis.
 // TODO(mingrammer): export prometheus metrics.
 type Kinesumer struct {
@@ -233,10 +180,9 @@ type Kinesumer struct {
 	wait sync.WaitGroup
 	stop chan struct{}
 	// Lock for pausing and starting.
-	mu          *sync.Mutex
-	commitMu    sync.Mutex
-	pollingStop *pollingStopState
-	close       chan struct{}
+	mu       *sync.Mutex
+	commitMu sync.Mutex
+	close    chan struct{}
 }
 
 // NewKinesumer initializes and returns a new Kinesumer client.
@@ -545,19 +491,6 @@ func (k *Kinesumer) start() {
 	if k.efoMode {
 		k.consumeEFOMode()
 	} else {
-		workerCount := 0
-		for _, shards := range k.shards {
-			workerCount += len(shards)
-		}
-		if workerCount <= 1 {
-			// Only multiple workers need a coordinated final flush.
-			k.pollingStop = nil
-		} else {
-			if k.pollingStop == nil {
-				k.pollingStop = &pollingStopState{}
-			}
-			k.pollingStop.reset(workerCount, k.autoCommit)
-		}
 		k.consumePolling()
 	}
 
@@ -565,13 +498,9 @@ func (k *Kinesumer) start() {
 		if k.efoMode {
 			go k.commitPeriodically()
 		} else {
-			state := k.pollingStop
 			k.wait.Add(1)
 			go func() {
 				defer k.wait.Done()
-				if state != nil {
-					defer state.workerReady()
-				}
 				k.commitPeriodically()
 			}()
 		}
@@ -580,21 +509,6 @@ func (k *Kinesumer) start() {
 
 func (k *Kinesumer) pause() {
 	close(k.stop)
-
-	if k.efoMode {
-		k.wait.Wait()
-		return
-	}
-
-	state := k.pollingStop
-	if state == nil {
-		k.wait.Wait()
-		return
-	}
-
-	state.waitUntilReady()
-	k.commitPollingCheckPoints()
-	state.finishFlush()
 	k.wait.Wait()
 }
 
@@ -716,35 +630,21 @@ func (k *Kinesumer) consumePolling() {
 }
 
 func (k *Kinesumer) consumeLoop(stream string, shard *Shard) {
-	state := k.pollingStop
 	defer k.wait.Done()
 
 	for {
 		select {
 		case <-k.stop:
-			if state == nil {
-				k.commitPollingShard(stream, shard.ID)
-			} else {
-				state.workerReady()
-				state.waitForFlush()
-			}
+			k.commitPollingShard(stream, shard.ID)
 			return
 		case <-k.close:
-			if state == nil {
-				k.commitPollingShard(stream, shard.ID)
-			} else {
-				state.workerReady()
-				state.waitForFlush()
-			}
+			k.commitPollingShard(stream, shard.ID)
 			return
 		default:
 			time.Sleep(k.scanInterval)
 			records, closed := k.consumeOnce(stream, shard)
 			if closed {
 				k.cleanupOffsets(stream, shard)
-				if state != nil {
-					state.workerReady()
-				}
 				return // Close consume loop if shard is CLOSED and has no data.
 			}
 
@@ -874,24 +774,16 @@ func (k *Kinesumer) MarkRecord(record *Record) {
 // Commit updates check point using current checkpoints.
 func (k *Kinesumer) Commit() {
 	if k.efoMode {
-		k.commitCheckPoints(false)
+		k.commitCheckPoints()
 		return
 	}
 	k.commitMu.Lock()
 	defer k.commitMu.Unlock()
 
-	k.commitCheckPoints(false)
+	k.commitCheckPoints()
 }
 
-// commitPollingCheckPoints persists assigned offsets after polling workers stop.
-func (k *Kinesumer) commitPollingCheckPoints() {
-	k.commitMu.Lock()
-	defer k.commitMu.Unlock()
-
-	k.commitCheckPoints(true)
-}
-
-// commitPollingShard persists the only assigned shard when a polling cycle has one worker.
+// commitPollingShard persists the assigned shard when a polling worker stops.
 func (k *Kinesumer) commitPollingShard(stream, shardID string) {
 	k.commitMu.Lock()
 	defer k.commitMu.Unlock()
@@ -907,50 +799,20 @@ func (k *Kinesumer) commitPollingShard(stream, shardID string) {
 			})
 		}
 	}
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		k.commitCheckPointsPerStream(stream, checkpoints)
-	}()
-	wg.Wait()
+	k.commitCheckPointsPerStream(stream, checkpoints)
 }
 
-func (k *Kinesumer) commitCheckPoints(assignedOnly bool) {
+func (k *Kinesumer) commitCheckPoints() {
 	var wg sync.WaitGroup
-	for stream, shards := range k.shards {
+	for stream := range k.shards {
 		offsets := k.offsets[stream]
 		if offsets == nil {
 			continue
 		}
-
-		var assigned map[string]struct{}
-		if assignedOnly {
-			if len(shards) == 0 {
-				continue
-			}
-			if len(shards) > 1 {
-				assigned = make(map[string]struct{}, len(shards))
-				for _, shard := range shards {
-					if shard != nil {
-						assigned[shard.ID] = struct{}{}
-					}
-				}
-			}
-		}
+		wg.Add(1)
 
 		var checkpoints []*ShardCheckPoint
 		offsets.Range(func(shardID, seqNum interface{}) bool {
-			if assignedOnly {
-				shardIDString := shardID.(string)
-				if len(shards) == 1 {
-					if shards[0] == nil || shards[0].ID != shardIDString {
-						return true
-					}
-				} else if _, ok := assigned[shardIDString]; !ok {
-					return true
-				}
-			}
 			checkpoints = append(checkpoints, &ShardCheckPoint{
 				Stream:         stream,
 				ShardID:        shardID.(string),
@@ -960,7 +822,6 @@ func (k *Kinesumer) commitCheckPoints(assignedOnly bool) {
 			return true
 		})
 
-		wg.Add(1)
 		go func(stream string, checkpoints []*ShardCheckPoint) {
 			defer wg.Done()
 			k.commitCheckPointsPerStream(stream, checkpoints)
