@@ -126,13 +126,11 @@ type efoMeta struct {
 
 // pollingStopState tracks quiescent polling workers for one lifecycle flush.
 type pollingStopState struct {
-	mu           sync.Mutex
-	cond         *sync.Cond
-	workerCount  int
-	total        int
-	ready        int
-	flushStarted bool
-	flushDone    bool
+	mu        sync.Mutex
+	cond      *sync.Cond
+	total     int
+	ready     int
+	flushDone bool
 }
 
 func (s *pollingStopState) reset(workerCount int, hasPeriodicCommit bool) {
@@ -140,23 +138,13 @@ func (s *pollingStopState) reset(workerCount int, hasPeriodicCommit bool) {
 	if s.cond == nil {
 		s.cond = sync.NewCond(&s.mu)
 	}
-	s.workerCount = workerCount
 	s.total = workerCount
 	if hasPeriodicCommit {
 		s.total++
 	}
 	s.ready = 0
-	s.flushStarted = false
 	s.flushDone = false
 	s.mu.Unlock()
-}
-
-func (s *pollingStopState) active() bool {
-	return s.total > 0
-}
-
-func (s *pollingStopState) canFlushBeforeWorkerExit() bool {
-	return s.workerCount == 1 && s.total == 1
 }
 
 func (s *pollingStopState) workerReady() {
@@ -182,20 +170,7 @@ func (s *pollingStopState) waitForFlush() {
 	}
 }
 
-func (s *pollingStopState) flushOnce(flush func()) {
-	s.mu.Lock()
-	for s.flushStarted && !s.flushDone {
-		s.cond.Wait()
-	}
-	if s.flushDone {
-		s.mu.Unlock()
-		return
-	}
-	s.flushStarted = true
-	s.mu.Unlock()
-
-	flush()
-
+func (s *pollingStopState) finishFlush() {
 	s.mu.Lock()
 	s.flushDone = true
 	s.cond.Broadcast()
@@ -574,8 +549,8 @@ func (k *Kinesumer) start() {
 		for _, shards := range k.shards {
 			workerCount += len(shards)
 		}
-		if workerCount == 1 && !k.autoCommit {
-			// One worker cannot duplicate a consumer-wide commit; preserve its direct exit commit.
+		if workerCount <= 1 {
+			// Only multiple workers need a coordinated final flush.
 			k.pollingStop = nil
 		} else {
 			if k.pollingStop == nil {
@@ -594,7 +569,9 @@ func (k *Kinesumer) start() {
 			k.wait.Add(1)
 			go func() {
 				defer k.wait.Done()
-				defer state.workerReady()
+				if state != nil {
+					defer state.workerReady()
+				}
 				k.commitPeriodically()
 			}()
 		}
@@ -614,18 +591,10 @@ func (k *Kinesumer) pause() {
 		k.wait.Wait()
 		return
 	}
-	if !state.active() {
-		k.wait.Wait()
-		k.commitPollingCheckPoints()
-		return
-	}
-	if state.canFlushBeforeWorkerExit() {
-		k.wait.Wait()
-		return
-	}
 
 	state.waitUntilReady()
-	state.flushOnce(k.commitPollingCheckPoints)
+	k.commitPollingCheckPoints()
+	state.finishFlush()
 	k.wait.Wait()
 }
 
@@ -754,28 +723,18 @@ func (k *Kinesumer) consumeLoop(stream string, shard *Shard) {
 		select {
 		case <-k.stop:
 			if state == nil {
-				k.commitCheckPoints(false)
-			} else if state.active() {
-				if state.canFlushBeforeWorkerExit() {
-					// Preserve the existing one-worker exit commit path when no periodic loop exists.
-					k.commitCheckPoints(false)
-				} else {
-					state.workerReady()
-					state.waitForFlush()
-				}
+				k.commitPollingShard(stream, shard.ID)
+			} else {
+				state.workerReady()
+				state.waitForFlush()
 			}
 			return
 		case <-k.close:
 			if state == nil {
-				k.commitCheckPoints(false)
-			} else if state.active() {
-				if state.canFlushBeforeWorkerExit() {
-					// Preserve the existing one-worker exit commit path when no periodic loop exists.
-					k.commitCheckPoints(false)
-				} else {
-					state.workerReady()
-					state.waitForFlush()
-				}
+				k.commitPollingShard(stream, shard.ID)
+			} else {
+				state.workerReady()
+				state.waitForFlush()
 			}
 			return
 		default:
@@ -783,7 +742,7 @@ func (k *Kinesumer) consumeLoop(stream string, shard *Shard) {
 			records, closed := k.consumeOnce(stream, shard)
 			if closed {
 				k.cleanupOffsets(stream, shard)
-				if state != nil && state.active() && !state.canFlushBeforeWorkerExit() {
+				if state != nil {
 					state.workerReady()
 				}
 				return // Close consume loop if shard is CLOSED and has no data.
@@ -930,6 +889,31 @@ func (k *Kinesumer) commitPollingCheckPoints() {
 	defer k.commitMu.Unlock()
 
 	k.commitCheckPoints(true)
+}
+
+// commitPollingShard persists the only assigned shard when a polling cycle has one worker.
+func (k *Kinesumer) commitPollingShard(stream, shardID string) {
+	k.commitMu.Lock()
+	defer k.commitMu.Unlock()
+
+	var checkpoints []*ShardCheckPoint
+	if offsets := k.offsets[stream]; offsets != nil {
+		if seqNum, ok := offsets.Load(shardID); ok {
+			checkpoints = append(checkpoints, &ShardCheckPoint{
+				Stream:         stream,
+				ShardID:        shardID,
+				SequenceNumber: seqNum.(string),
+				UpdatedAt:      time.Now(),
+			})
+		}
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		k.commitCheckPointsPerStream(stream, checkpoints)
+	}()
+	wg.Wait()
 }
 
 func (k *Kinesumer) commitCheckPoints(assignedOnly bool) {

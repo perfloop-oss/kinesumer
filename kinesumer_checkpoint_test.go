@@ -369,6 +369,7 @@ func TestPollingFinalFlushPrecedesWorkerExit(t *testing.T) {
 		rebalance bool
 	}{
 		{name: "close"},
+		{name: "refresh"},
 		{name: "shard sync", rebalance: true},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -448,17 +449,21 @@ func TestPollingFinalFlushPrecedesWorkerExit(t *testing.T) {
 			}
 
 			gatedStore.blockSubsequentWrites()
-			if testCase.rebalance {
+			stop := k.stop
+			switch testCase.name {
+			case "close":
+				go func() { k.Close(); close(operationDone) }()
+			case "refresh":
+				go func() { k.Refresh(k.streams); close(operationDone) }()
+			case "shard sync":
 				operationErr = make(chan error, 1)
 				go func() {
 					operationErr <- k.syncShardInfoForStream(context.Background(), "stream-0", 0, 2)
 					close(operationDone)
 				}()
-			} else {
-				go func() { k.Close(); close(operationDone) }()
 			}
 			select {
-			case <-k.stop:
+			case <-stop:
 			case <-time.After(3 * time.Second):
 				t.Fatal("lifecycle operation did not signal polling workers")
 			}
@@ -485,7 +490,7 @@ func TestPollingFinalFlushPrecedesWorkerExit(t *testing.T) {
 				t.Fatal("polling worker returned before its final checkpoint write completed")
 			default:
 			}
-			if !testCase.rebalance && isKinesumerClosedForTest(k) {
+			if testCase.name == "close" && isKinesumerClosedForTest(k) {
 				t.Fatal("Close exposed deregistration before its final checkpoint write completed")
 			}
 
@@ -495,7 +500,7 @@ func TestPollingFinalFlushPrecedesWorkerExit(t *testing.T) {
 			case <-time.After(10 * time.Second):
 				t.Fatal("lifecycle operation did not finish after the final write")
 			}
-			for range k.shards["stream-0"] {
+			for range []string{"shard-a", "shard-b"} {
 				select {
 				case <-workerDone:
 				case <-time.After(3 * time.Second):
@@ -512,15 +517,110 @@ func TestPollingFinalFlushPrecedesWorkerExit(t *testing.T) {
 				}
 			}
 			gatedStore.allowWrites()
+			if testCase.name == "refresh" {
+				for _, shardID := range []string{"shard-a", "shard-b"} {
+					if got := baseStore.checkpoint("stream-0", shardID); got != "200" {
+						t.Fatalf("Refresh left %s checkpoint at %q, want 200", shardID, got)
+					}
+				}
+				return
+			}
 			if err := baseStore.UpdateCheckPoints(context.Background(), []*ShardCheckPoint{{
 				Stream: "stream-0", ShardID: "shard-b", SequenceNumber: "300",
 			}}); err != nil {
 				t.Fatal(err)
 			}
+			if testCase.rebalance {
+				k.Close()
+			}
 			if got := baseStore.checkpoint("stream-0", "shard-b"); got != "300" {
 				t.Fatalf("successor checkpoint was overwritten with %q", got)
 			}
 		})
+	}
+}
+
+func TestPollingSingleWorkerCommitPrecedesCloseReturn(t *testing.T) {
+	baseStore := newPollingCheckpointStore()
+	store := &handoffCheckpointStore{
+		pollingCheckpointStore: baseStore,
+		started:                make(chan []*ShardCheckPoint, 1),
+		release:                make(chan struct{}),
+	}
+	fixture := newPollingKinesisFixture(t, true)
+	k := newPollingKinesumer(t, store, 1, fixture)
+	k.autoCommit = true
+	k.commitInterval = time.Hour
+
+	workerDone := make(chan struct{})
+	k.wait.Add(1)
+	go func() {
+		k.consumeLoop("stream-0", k.shards["stream-0"][0])
+		close(workerDone)
+	}()
+
+	var operationDone chan struct{}
+	t.Cleanup(func() {
+		store.releaseWrite()
+		if operationDone != nil {
+			select {
+			case <-operationDone:
+			case <-time.After(8 * time.Second):
+			}
+		}
+		if !isKinesumerClosedForTest(k) {
+			k.Close()
+		}
+	})
+
+	select {
+	case <-fixture.afterMark:
+	case <-time.After(3 * time.Second):
+		t.Fatal("worker did not automatically mark sequence 200")
+	}
+	store.blockSubsequentWrites()
+	operationDone = make(chan struct{})
+	go func() { k.Close(); close(operationDone) }()
+	select {
+	case <-k.stop:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close did not signal the polling worker")
+	}
+
+	select {
+	case checkpoints := <-store.started:
+		if len(checkpoints) != 1 || checkpoints[0].SequenceNumber != "200" {
+			t.Fatalf("worker checkpoint write = %v, want one row at 200", checkpoints)
+		}
+	case <-operationDone:
+		t.Fatal("Close returned before submitting the worker checkpoint")
+	case <-time.After(8 * time.Second):
+		t.Fatal("worker checkpoint write did not reach the controlled state")
+	}
+	select {
+	case <-workerDone:
+		t.Fatal("single polling worker returned before its checkpoint write completed")
+	default:
+	}
+
+	store.releaseWrite()
+	select {
+	case <-workerDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("worker did not return after its checkpoint write completed")
+	}
+	select {
+	case <-operationDone:
+	case <-time.After(8 * time.Second):
+		t.Fatal("Close did not finish after the worker checkpoint write")
+	}
+	if err := baseStore.UpdateCheckPoints(context.Background(), []*ShardCheckPoint{{
+		Stream: "stream-0", ShardID: "shard-0", SequenceNumber: "300",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := baseStore.checkpoint("stream-0", "shard-0"); got != "300" {
+		t.Fatalf("successor checkpoint was overwritten with %q", got)
 	}
 }
 
