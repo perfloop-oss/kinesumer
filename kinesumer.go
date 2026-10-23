@@ -181,7 +181,7 @@ type Kinesumer struct {
 	stop chan struct{}
 	// Lock for pausing and starting.
 	mu       *sync.Mutex
-	commitMu sync.Mutex
+	commitMu sync.RWMutex
 	close    chan struct{}
 }
 
@@ -785,8 +785,8 @@ func (k *Kinesumer) Commit() {
 
 // commitPollingShard persists the assigned shard when a polling worker stops.
 func (k *Kinesumer) commitPollingShard(stream, shardID string) {
-	k.commitMu.Lock()
-	defer k.commitMu.Unlock()
+	k.commitMu.RLock()
+	defer k.commitMu.RUnlock()
 
 	var checkpoints []*ShardCheckPoint
 	if offsets := k.offsets[stream]; offsets != nil {
