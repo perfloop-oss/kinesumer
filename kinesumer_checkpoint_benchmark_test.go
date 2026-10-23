@@ -20,18 +20,26 @@ func BenchmarkPollingRefreshCheckpointSubmissions(b *testing.B) {
 			k.start()
 			fixture.waitForRecords(b, testCase.streamCount)
 
-			var calls, rows int
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				beforeCalls, beforeRows := store.stats()
-				k.Refresh(k.streams)
-				afterCalls, afterRows := store.stats()
-				calls += afterCalls - beforeCalls
-				rows += afterRows - beforeRows
+			if testCase.streamCount == 1 {
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					k.Refresh(k.streams)
+				}
+				b.StopTimer()
+			} else {
+				var calls, rows int
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					beforeCalls, beforeRows := store.stats()
+					k.Refresh(k.streams)
+					afterCalls, afterRows := store.stats()
+					calls += afterCalls - beforeCalls
+					rows += afterRows - beforeRows
+				}
+				b.StopTimer()
+				b.ReportMetric(float64(calls)/float64(b.N), "UpdateCheckPoints/op")
+				b.ReportMetric(float64(rows)/float64(b.N), "CheckpointRows/op")
 			}
-			b.StopTimer()
-			b.ReportMetric(float64(calls)/float64(b.N), "UpdateCheckPoints/op")
-			b.ReportMetric(float64(rows)/float64(b.N), "CheckpointRows/op")
 			k.pause()
 		})
 	}
