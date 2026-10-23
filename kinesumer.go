@@ -124,6 +124,84 @@ type efoMeta struct {
 	consumerName string
 }
 
+// pollingStopState tracks quiescent polling workers for one lifecycle flush.
+type pollingStopState struct {
+	mu           sync.Mutex
+	cond         *sync.Cond
+	workerCount  int
+	total        int
+	ready        int
+	flushStarted bool
+	flushDone    bool
+}
+
+func (s *pollingStopState) reset(workerCount int, hasPeriodicCommit bool) {
+	s.mu.Lock()
+	if s.cond == nil {
+		s.cond = sync.NewCond(&s.mu)
+	}
+	s.workerCount = workerCount
+	s.total = workerCount
+	if hasPeriodicCommit {
+		s.total++
+	}
+	s.ready = 0
+	s.flushStarted = false
+	s.flushDone = false
+	s.mu.Unlock()
+}
+
+func (s *pollingStopState) active() bool {
+	return s.total > 0
+}
+
+func (s *pollingStopState) canFlushBeforeWorkerExit() bool {
+	return s.workerCount == 1 && s.total == 1
+}
+
+func (s *pollingStopState) workerReady() {
+	s.mu.Lock()
+	s.ready++
+	s.cond.Broadcast()
+	s.mu.Unlock()
+}
+
+func (s *pollingStopState) waitUntilReady() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for s.ready < s.total {
+		s.cond.Wait()
+	}
+}
+
+func (s *pollingStopState) waitForFlush() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for !s.flushDone {
+		s.cond.Wait()
+	}
+}
+
+func (s *pollingStopState) flushOnce(flush func()) {
+	s.mu.Lock()
+	for s.flushStarted && !s.flushDone {
+		s.cond.Wait()
+	}
+	if s.flushDone {
+		s.mu.Unlock()
+		return
+	}
+	s.flushStarted = true
+	s.mu.Unlock()
+
+	flush()
+
+	s.mu.Lock()
+	s.flushDone = true
+	s.cond.Broadcast()
+	s.mu.Unlock()
+}
+
 // Kinesumer implements auto re-balancing consumer group for Kinesis.
 // TODO(mingrammer): export prometheus metrics.
 type Kinesumer struct {
@@ -176,12 +254,14 @@ type Kinesumer struct {
 	commitTimeout  time.Duration
 	commitInterval time.Duration
 
-	// To wait the running consumer loops when stopping.
+	// To wait for consumer workers and the polling periodic commit loop when stopping.
 	wait sync.WaitGroup
 	stop chan struct{}
 	// Lock for pausing and starting.
-	mu    *sync.Mutex
-	close chan struct{}
+	mu          *sync.Mutex
+	commitMu    sync.Mutex
+	pollingStop *pollingStopState
+	close       chan struct{}
 }
 
 // NewKinesumer initializes and returns a new Kinesumer client.
@@ -490,17 +570,62 @@ func (k *Kinesumer) start() {
 	if k.efoMode {
 		k.consumeEFOMode()
 	} else {
+		workerCount := 0
+		for _, shards := range k.shards {
+			workerCount += len(shards)
+		}
+		if workerCount == 1 && !k.autoCommit {
+			// One worker cannot duplicate a consumer-wide commit; preserve its direct exit commit.
+			k.pollingStop = nil
+		} else {
+			if k.pollingStop == nil {
+				k.pollingStop = &pollingStopState{}
+			}
+			k.pollingStop.reset(workerCount, k.autoCommit)
+		}
 		k.consumePolling()
 	}
 
 	if k.autoCommit {
-		go k.commitPeriodically()
+		if k.efoMode {
+			go k.commitPeriodically()
+		} else {
+			state := k.pollingStop
+			k.wait.Add(1)
+			go func() {
+				defer k.wait.Done()
+				defer state.workerReady()
+				k.commitPeriodically()
+			}()
+		}
 	}
 }
 
 func (k *Kinesumer) pause() {
 	close(k.stop)
 
+	if k.efoMode {
+		k.wait.Wait()
+		return
+	}
+
+	state := k.pollingStop
+	if state == nil {
+		k.wait.Wait()
+		return
+	}
+	if !state.active() {
+		k.wait.Wait()
+		k.commitPollingCheckPoints()
+		return
+	}
+	if state.canFlushBeforeWorkerExit() {
+		k.wait.Wait()
+		return
+	}
+
+	state.waitUntilReady()
+	state.flushOnce(k.commitPollingCheckPoints)
 	k.wait.Wait()
 }
 
@@ -622,21 +747,45 @@ func (k *Kinesumer) consumePolling() {
 }
 
 func (k *Kinesumer) consumeLoop(stream string, shard *Shard) {
+	state := k.pollingStop
 	defer k.wait.Done()
 
 	for {
 		select {
 		case <-k.stop:
-			k.Commit()
+			if state == nil {
+				k.commitCheckPoints(false)
+			} else if state.active() {
+				if state.canFlushBeforeWorkerExit() {
+					// Preserve the existing one-worker exit commit path when no periodic loop exists.
+					k.commitCheckPoints(false)
+				} else {
+					state.workerReady()
+					state.waitForFlush()
+				}
+			}
 			return
 		case <-k.close:
-			k.Commit()
+			if state == nil {
+				k.commitCheckPoints(false)
+			} else if state.active() {
+				if state.canFlushBeforeWorkerExit() {
+					// Preserve the existing one-worker exit commit path when no periodic loop exists.
+					k.commitCheckPoints(false)
+				} else {
+					state.workerReady()
+					state.waitForFlush()
+				}
+			}
 			return
 		default:
 			time.Sleep(k.scanInterval)
 			records, closed := k.consumeOnce(stream, shard)
 			if closed {
 				k.cleanupOffsets(stream, shard)
+				if state != nil && state.active() && !state.canFlushBeforeWorkerExit() {
+					state.workerReady()
+				}
 				return // Close consume loop if shard is CLOSED and has no data.
 			}
 
@@ -765,12 +914,59 @@ func (k *Kinesumer) MarkRecord(record *Record) {
 
 // Commit updates check point using current checkpoints.
 func (k *Kinesumer) Commit() {
+	if k.efoMode {
+		k.commitCheckPoints(false)
+		return
+	}
+	k.commitMu.Lock()
+	defer k.commitMu.Unlock()
+
+	k.commitCheckPoints(false)
+}
+
+// commitPollingCheckPoints persists assigned offsets after polling workers stop.
+func (k *Kinesumer) commitPollingCheckPoints() {
+	k.commitMu.Lock()
+	defer k.commitMu.Unlock()
+
+	k.commitCheckPoints(true)
+}
+
+func (k *Kinesumer) commitCheckPoints(assignedOnly bool) {
 	var wg sync.WaitGroup
-	for stream := range k.shards {
-		wg.Add(1)
+	for stream, shards := range k.shards {
+		offsets := k.offsets[stream]
+		if offsets == nil {
+			continue
+		}
+
+		var assigned map[string]struct{}
+		if assignedOnly {
+			if len(shards) == 0 {
+				continue
+			}
+			if len(shards) > 1 {
+				assigned = make(map[string]struct{}, len(shards))
+				for _, shard := range shards {
+					if shard != nil {
+						assigned[shard.ID] = struct{}{}
+					}
+				}
+			}
+		}
 
 		var checkpoints []*ShardCheckPoint
-		k.offsets[stream].Range(func(shardID, seqNum interface{}) bool {
+		offsets.Range(func(shardID, seqNum interface{}) bool {
+			if assignedOnly {
+				shardIDString := shardID.(string)
+				if len(shards) == 1 {
+					if shards[0] == nil || shards[0].ID != shardIDString {
+						return true
+					}
+				} else if _, ok := assigned[shardIDString]; !ok {
+					return true
+				}
+			}
 			checkpoints = append(checkpoints, &ShardCheckPoint{
 				Stream:         stream,
 				ShardID:        shardID.(string),
@@ -780,6 +976,7 @@ func (k *Kinesumer) Commit() {
 			return true
 		})
 
+		wg.Add(1)
 		go func(stream string, checkpoints []*ShardCheckPoint) {
 			defer wg.Done()
 			k.commitCheckPointsPerStream(stream, checkpoints)
@@ -819,6 +1016,10 @@ func (k *Kinesumer) Refresh(streams []string) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 
+	if !k.efoMode && k.isClosed() {
+		return
+	}
+
 	k.pause()
 	// TODO(mingrammer): Deregister the EFO consumers.
 
@@ -845,11 +1046,19 @@ func (k *Kinesumer) sendOrDiscardError(err error) {
 
 // Close stops the consuming and sync jobs.
 func (k *Kinesumer) Close() {
+	if !k.efoMode {
+		k.mu.Lock()
+	}
+
 	log.Info().
 		Msg("kinesumer: closing the kinesumer")
-	close(k.close)
-
-	k.wait.Wait()
+	if k.efoMode {
+		close(k.close)
+		k.wait.Wait()
+	} else {
+		k.pause()
+		close(k.close)
+	}
 
 	// Client should drain the remaining records.
 	close(k.records)
@@ -862,8 +1071,21 @@ func (k *Kinesumer) Close() {
 
 	// TODO(mingrammer): Deregister the EFO consumers.
 
+	if !k.efoMode {
+		k.mu.Unlock()
+	}
+
 	// Wait last sync jobs.
 	time.Sleep(syncTimeout)
 	log.Info().
 		Msg("kinesumer: shutdown successfully")
+}
+
+func (k *Kinesumer) isClosed() bool {
+	select {
+	case <-k.close:
+		return true
+	default:
+		return false
+	}
 }

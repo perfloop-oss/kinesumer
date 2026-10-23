@@ -44,8 +44,11 @@ func (s *pollingCheckpointStore) DeregisterClient(context.Context, string) error
 func (s *pollingCheckpointStore) PingClientAliveness(context.Context, string) error { return nil }
 func (s *pollingCheckpointStore) PruneClients(context.Context) error                { return nil }
 func (s *pollingCheckpointStore) ListCheckPoints(
-	context.Context, string, []string,
+	_ context.Context, _ string, shardIDs []string,
 ) (map[string]string, error) {
+	if len(shardIDs) == 0 {
+		return nil, ErrEmptyShardIDs
+	}
 	return map[string]string{}, nil
 }
 func (s *pollingCheckpointStore) UpdateCheckPoints(
@@ -86,11 +89,13 @@ func (s *pollingCheckpointStore) checkpoint(stream, shard string) string {
 }
 
 type pollingKinesisFixture struct {
-	server     *httptest.Server
-	mu         sync.Mutex
-	calls      map[string]int
-	afterMark  chan string
-	emitRecord bool
+	server        *httptest.Server
+	mu            sync.Mutex
+	calls         map[string]int
+	afterMark     chan string
+	emitRecord    bool
+	blockedReads  map[string]<-chan struct{}
+	resourceInUse map[string]bool
 }
 
 func newPollingKinesisFixture(tb testing.TB, emitRecord bool) *pollingKinesisFixture {
@@ -106,13 +111,13 @@ func newPollingKinesisFixture(tb testing.TB, emitRecord bool) *pollingKinesisFix
 		case "Kinesis_20131202.GetShardIterator":
 			var input struct {
 				StreamName string
-				ShardId    string
+				ShardID    string `json:"ShardId"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			_, _ = fmt.Fprintf(w, `{"ShardIterator":%q}`, input.StreamName+"/"+input.ShardId)
+			_, _ = fmt.Fprintf(w, `{"ShardIterator":%q}`, input.StreamName+"/"+input.ShardID)
 		case "Kinesis_20131202.GetRecords":
 			var input struct {
 				ShardIterator string
@@ -134,6 +139,16 @@ func newPollingKinesisFixture(tb testing.TB, emitRecord bool) *pollingKinesisFix
 			}
 			if fixture.emitRecord && call == 1 {
 				fixture.afterMark <- input.ShardIterator
+				if release, ok := fixture.blockedReads[input.ShardIterator]; ok {
+					<-release
+					if fixture.resourceInUse[input.ShardIterator] {
+						w.Header().Set("x-amzn-errortype", "ResourceInUseException")
+						w.WriteHeader(http.StatusBadRequest)
+						_, _ = fmt.Fprint(w,
+							`{"__type":"ResourceInUseException","message":"ownership changed"}`)
+						return
+					}
+				}
 			}
 			_, _ = fmt.Fprintf(w, `{"Records":[],"NextShardIterator":%q}`, input.ShardIterator)
 		default:
